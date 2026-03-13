@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Dix-Cordes</title>
+  <link rel="icon" href="favicon.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <button id="theme-toggle" aria-label="Toggle theme"></button>
+  <div id="app">
+    <div id="brand">
+      <img src="logo.webp" alt="Dix-Cordes" id="logo" width="120" height="79" onload="this.classList.add('loaded')">
+      <h1>Dix-Cordes</h1>
+      <p>Voice, nothing else.</p>
+    </div>
+
+    <div id="landing-view" hidden>
+      <div class="actions">
+        <button id="create-room-btn" aria-label="Create room"></button>
+        <div class="join-form">
+          <input type="text" id="room-input" placeholder="room-name" autocomplete="off" maxlength="30">
+          <button id="join-room-btn" disabled aria-label="Join room"></button>
+        </div>
+      </div>
+      <div id="starred-rooms" hidden>
+        <h3>Starred Rooms</h3>
+        <ul id="starred-list"></ul>
+      </div>
+      <div id="recent-rooms" hidden>
+        <h3>Recent Rooms</h3>
+        <ul id="recent-list"></ul>
+      </div>
+    </div>
+
+    <div id="room-view" hidden>
+      <header>
+        <div class="room-title">
+          <h2 id="room-name"></h2>
+          <button id="star-btn" aria-label="Star room"></button>
+        </div>
+        <div class="header-controls">
+          <button id="share-btn" hidden aria-label="Share screen"></button>
+          <button id="leave-btn" aria-label="Leave room"></button>
+        </div>
+      </header>
+      <div id="status-banner" hidden></div>
+      <div id="screen-share" hidden>
+        <video id="screen-video" autoplay playsinline></video>
+        <button id="fullscreen-btn" aria-label="Toggle fullscreen"></button>
+      </div>
+      <ul id="peer-list"></ul>
+      <div id="chat">
+        <div id="chat-messages"></div>
+        <div class="chat-input">
+          <input type="text" id="chat-input" placeholder="Type a message..." autocomplete="off">
+          <button id="chat-send-btn" disabled aria-label="Send message"></button>
+        </div>
+      </div>
+    </div>
+
+    <div id="error-view" hidden>
+      <h2>Microphone Required</h2>
+      <p>This app needs microphone access to work. Please allow microphone access and reload.</p>
+      <button id="back-btn" aria-label="Go back"></button>
+    </div>
+  </div>
+
+  <footer>Made with ❤️ by <a href="https://github.com/christianblais">Christian Blais</a></footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="app.js"></script>
+</body>
+</html>
