@@ -127,8 +127,11 @@ const URL_REGEX = /(https?:\/\/|www\.)[^\s<>"']+/gi;
 
 let vadInterval = null;
 let audioCtx = null;
+let makingOffer = false;
+let prevScreenTrack = null;
 
 const vadTrackers = new Map();
+const vadElements = new Map();
 
 function createVadTracker(key, stream) {
   if (!audioCtx) audioCtx = new AudioContext();
@@ -187,10 +190,7 @@ function startVadPolling() {
       if (peak + 128 > VAD_THRESHOLD) tracker.lastSpeaking = now;
       tracker.speaking = (now - tracker.lastSpeaking) < VAD_SILENCE_DELAY;
 
-      const peerId = key === 'local' ? 'self' : key;
-      const el = peerId === 'self'
-        ? peerList.querySelector('.peer.self')
-        : peerList.querySelector(`.peer[data-peer-id="${peerId}"]`);
+      const el = vadElements.get(key);
       if (el) el.classList.toggle('speaking', tracker.speaking);
     }
   }, VAD_INTERVAL_MS);
@@ -230,12 +230,12 @@ function toggleStarRoom(roomName) {
     rooms.push(roomName);
   }
   saveStarredRooms(rooms);
-  updateStarBtn();
+  updateStarBtn(state.roomName ? rooms.includes(state.roomName) : undefined);
 }
 
-function updateStarBtn() {
+function updateStarBtn(starred) {
   if (!state.roomName) return;
-  starBtn.innerHTML = isRoomStarred(state.roomName) ? ICON.starFill : ICON.star;
+  starBtn.innerHTML = (starred ?? isRoomStarred(state.roomName)) ? ICON.starFill : ICON.star;
 }
 
 function renderStarredRooms() {
@@ -579,6 +579,7 @@ async function leaveRoom() {
 
 function leaveRoomSync() {
   cleanupMedia();
+  unsubscribePeekAll();
 
   if (state.channel) {
     try { state.channel.untrack(); } catch (_) {}
@@ -630,7 +631,7 @@ async function startSharing() {
   updateShareUI();
   channelTrack();
 
-  videoTrack.addEventListener('ended', stopSharing);
+  videoTrack.addEventListener('ended', stopSharing, { once: true });
 }
 
 function stopSharing() {
@@ -657,6 +658,11 @@ function stopSharing() {
   channelTrack();
 }
 
+function onScreenTrackEnded() {
+  screenVideo.srcObject = null;
+  screenShareEl.hidden = true;
+}
+
 function updateShareUI() {
   const remoteSharing = [...state.peers.values()].some(p => p.sharing);
 
@@ -680,6 +686,7 @@ function toggleMute() {
 }
 
 function renderPeers() {
+  vadElements.clear();
   peerList.replaceChildren();
 
   peerList.appendChild(createPeerElement(`${state.displayName} (you)`, state.muted, true));
@@ -695,6 +702,7 @@ function createPeerElement(name, muted, isSelf, peerId) {
   if (peerId) li.dataset.peerId = peerId;
 
   const vadKey = isSelf ? 'local' : peerId;
+  vadElements.set(vadKey, li);
   const tracker = vadTrackers.get(vadKey);
   if (tracker?.speaking) li.classList.add('speaking');
 
@@ -979,10 +987,9 @@ async function createPeerConnection(peerId, name, initiator) {
     if (event.track.kind === 'video') {
       screenVideo.srcObject = event.streams[0];
       screenShareEl.hidden = false;
-      event.track.addEventListener('ended', () => {
-        screenVideo.srcObject = null;
-        screenShareEl.hidden = true;
-      });
+      if (prevScreenTrack) prevScreenTrack.removeEventListener('ended', onScreenTrackEnded);
+      prevScreenTrack = event.track;
+      event.track.addEventListener('ended', onScreenTrackEnded);
       return;
     }
 
@@ -1029,15 +1036,20 @@ async function createPeerConnection(peerId, name, initiator) {
   pc.onnegotiationneeded = async () => {
     if (state.channel !== channel) return;
     try {
-      await pc.setLocalDescription();
-      channelSend('signal', {
-        from: state.peerId,
-        to: peerId,
-        type: 'offer',
-        sdp: pc.localDescription,
-      });
+      makingOffer = true;
+      await pc.setLocalDescription(await pc.createOffer());
+      if (state.channel === channel) {
+        channelSend('signal', {
+          from: state.peerId,
+          to: peerId,
+          type: 'offer',
+          sdp: pc.localDescription,
+        });
+      }
     } catch (err) {
       console.warn('Renegotiation failed:', err);
+    } finally {
+      makingOffer = false;
     }
   };
 
@@ -1052,6 +1064,7 @@ async function createPeerConnection(peerId, name, initiator) {
 
   if (initiator) {
     try {
+      makingOffer = true;
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
 
@@ -1067,6 +1080,8 @@ async function createPeerConnection(peerId, name, initiator) {
       console.error(`Failed to create offer for ${name}:`, err);
       removePeer(peerId);
       return;
+    } finally {
+      makingOffer = false;
     }
   }
 }
@@ -1080,7 +1095,7 @@ async function handleSignal(payload) {
       const pc = peer?.connection;
 
       const polite = state.peerId > from;
-      const collision = pc && pc.signalingState !== 'stable';
+      const collision = pc && (makingOffer || pc.signalingState !== 'stable');
 
       if (collision && !polite) return;
 
@@ -1090,7 +1105,11 @@ async function handleSignal(payload) {
       }
       if (!peer?.connection) return;
 
-      await peer.connection.setRemoteDescription(payload.sdp);
+      const theirPc = peer.connection;
+      if (theirPc.signalingState !== 'stable') {
+        await theirPc.setLocalDescription({ type: 'rollback' });
+      }
+      await theirPc.setRemoteDescription(payload.sdp);
 
       for (const candidate of peer.iceCandidateBuffer) {
         await peer.connection.addIceCandidate(candidate);
@@ -1194,7 +1213,7 @@ fullscreenBtn.addEventListener('click', () => {
   if (document.fullscreenElement) {
     document.exitFullscreen();
   } else {
-    screenShareEl.requestFullscreen?.() || screenShareEl.webkitRequestFullscreen?.();
+    screenShareEl.requestFullscreen?.();
   }
 });
 

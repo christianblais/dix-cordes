@@ -2,16 +2,21 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Voice chat rooms. No accounts, no install.">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#7c5cbf" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#110e1a" media="(prefers-color-scheme: dark)">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; connect-src 'self' https://isrveflvlckfxufmvduq.supabase.co wss://isrveflvlckfxufmvduq.supabase.co; media-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;">
   <title>Dix-Cordes</title>
-  <link rel="icon" href="favicon.png">
+  <link rel="icon" href="favicon.png" type="image/png" sizes="any">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <button id="theme-toggle" aria-label="Toggle theme"></button>
   <div id="app">
     <div id="brand">
-      <img src="logo.webp" alt="Dix-Cordes" id="logo" width="120" height="79" onload="this.classList.add('loaded')">
+      <img src="logo.webp" alt="Dix-Cordes" id="logo" width="120" height="79">
       <h1>Dix-Cordes</h1>
       <p>Voice, nothing else.</p>
     </div>
@@ -20,7 +25,7 @@
       <div class="actions">
         <button id="create-room-btn" aria-label="Create room"></button>
         <div class="join-form">
-          <input type="text" id="room-input" placeholder="room-name" autocomplete="off" maxlength="30">
+          <input type="text" id="room-input" placeholder="room-name" autocomplete="off" maxlength="30" aria-label="Room name">
           <button id="join-room-btn" disabled aria-label="Join room"></button>
         </div>
       </div>
@@ -54,7 +59,7 @@
       <div id="chat">
         <div id="chat-messages"></div>
         <div class="chat-input">
-          <input type="text" id="chat-input" placeholder="Type a message..." autocomplete="off">
+          <input type="text" id="chat-input" placeholder="Type a message..." autocomplete="off" aria-label="Chat message">
           <button id="chat-send-btn" disabled aria-label="Send message"></button>
         </div>
       </div>
@@ -69,7 +74,7 @@
 
   <footer>Made with ❤️ by <a href="https://github.com/christianblais">Christian Blais</a></footer>
 
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.105.4" crossorigin="anonymous"></script>
   <script src="app.js"></script>
 </body>
 </html>
