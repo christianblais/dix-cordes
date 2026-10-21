@@ -123,12 +123,12 @@ const VAD_INTERVAL_MS = 50;
 const VAD_THRESHOLD = 135;
 const VAD_SILENCE_DELAY = 500;
 const SCREEN_MAX_BITRATE = 1_500_000;
+const ICE_GATHERING_TIMEOUT_MS = 2000;
+const CONNECT_TIMEOUT_MS = 10_000;
 const URL_REGEX = /(https?:\/\/|www\.)[^\s<>"']+/gi;
 
 let vadInterval = null;
 let audioCtx = null;
-let makingOffer = false;
-let prevScreenTrack = null;
 
 const vadTrackers = new Map();
 const vadElements = new Map();
@@ -419,9 +419,8 @@ const state = {
   peerId: crypto.randomUUID(),
   displayName: getSavedDisplayName() || generateDisplayName(),
   muted: getSavedMuted(),
-  sharing: false,
   screenStream: null,
-  screenSenders: new Map(),
+  session: 0,
   roomName: null,
   channel: null,
   localStream: null,
@@ -455,7 +454,7 @@ function channelSend(eventName, payload) {
 }
 
 function presencePayload() {
-  return { peerId: state.peerId, name: state.displayName, muted: state.muted, sharing: state.sharing };
+  return { peerId: state.peerId, name: state.displayName, muted: state.muted, sharing: !!state.screenStream };
 }
 
 function channelTrack() {
@@ -505,27 +504,45 @@ async function joinRoom(roomName) {
   shareBtn.hidden = !navigator.mediaDevices.getDisplayMedia;
   showBanner('Connecting...');
 
+  const session = state.session;
   try {
-    state.localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    await openMicrophone();
   } catch (err) {
+    if (state.session !== session) return;
     console.error('Microphone access denied:', err);
     state.roomName = null;
     showView(errorView);
     return;
   }
+  if (state.session !== session) return;
 
-  if (state.muted) {
-    state.localStream.getAudioTracks().forEach(t => { t.enabled = false; });
-  }
-
-  createVadTracker('local', state.localStream);
   startVadPolling();
-
   renderPeers();
   connectToRoom(roomName);
 }
 
+async function openMicrophone() {
+  const session = state.session;
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  if (state.session !== session) {
+    stream.getTracks().forEach(t => t.stop());
+    return;
+  }
+
+  const [track] = stream.getAudioTracks();
+  track.enabled = !state.muted;
+  track.addEventListener('ended', () => {
+    if (state.localStream === stream) openMicrophone().catch(err => console.error('Microphone lost:', err));
+  });
+
+  state.localStream = stream;
+  for (const peer of state.peers.values()) peer.pc?.getSenders()[0]?.replaceTrack(track);
+  removeVadTracker('local');
+  createVadTracker('local', stream);
+}
+
 function cleanupMedia() {
+  state.session++;
   stopVadPolling();
   clearAllVadTrackers();
 
@@ -533,8 +550,6 @@ function cleanupMedia() {
     state.screenStream.getTracks().forEach(t => t.stop());
     state.screenStream = null;
   }
-  state.screenSenders.clear();
-  state.sharing = false;
   screenVideo.srcObject = null;
   screenShareEl.hidden = true;
 
@@ -545,13 +560,13 @@ function cleanupMedia() {
 }
 
 function cleanupPeers() {
-  for (const id of [...state.peers.keys()]) {
-    removePeer(id);
-  }
+  for (const [id, peer] of state.peers) closeConnection(id, peer);
+  state.peers.clear();
 }
 
 async function leaveRoom() {
   cleanupMedia();
+  cleanupPeers();
 
   if (state.channel) {
     const channelToRemove = state.channel;
@@ -567,8 +582,6 @@ async function leaveRoom() {
       console.warn('Failed to remove channel:', err);
     }
   }
-
-  cleanupPeers();
 
   state.roomName = null;
   state.presenceReady = false;
@@ -593,17 +606,6 @@ function leaveRoomSync() {
   state.presenceReady = false;
 }
 
-async function capSenderBitrate(sender) {
-  try {
-    const params = sender.getParameters();
-    if (!params.encodings?.length) return;
-    params.encodings[0].maxBitrate = SCREEN_MAX_BITRATE;
-    await sender.setParameters(params);
-  } catch {
-    console.warn('Failed to cap sender bitrate');
-  }
-}
-
 async function startSharing() {
   try {
     state.screenStream = await navigator.mediaDevices.getDisplayMedia({
@@ -614,61 +616,35 @@ async function startSharing() {
     return;
   }
 
-  state.sharing = true;
-  const videoTrack = state.screenStream.getVideoTracks()[0];
+  const [track] = state.screenStream.getVideoTracks();
+  track.addEventListener('ended', stopSharing, { once: true });
+  for (const peer of state.peers.values()) peer.pc?.getSenders()[1]?.replaceTrack(track);
 
-  for (const [peerId, peer] of state.peers) {
-    if (isConnectionAlive(peer.connection)) {
-      const sender = peer.connection.addTrack(videoTrack, state.screenStream);
-      capSenderBitrate(sender);
-      state.screenSenders.set(peerId, sender);
-    }
-  }
-
-  screenVideo.srcObject = state.screenStream;
-  screenShareEl.hidden = false;
-
-  updateShareUI();
+  renderScreen();
   channelTrack();
-
-  videoTrack.addEventListener('ended', stopSharing, { once: true });
 }
 
 function stopSharing() {
-  if (!state.sharing) return;
+  if (!state.screenStream) return;
 
-  for (const [peerId, sender] of state.screenSenders) {
-    const peer = state.peers.get(peerId);
-    if (peer?.connection) {
-      try { peer.connection.removeTrack(sender); } catch {}
-    }
-  }
-  state.screenSenders.clear();
+  for (const peer of state.peers.values()) peer.pc?.getSenders()[1]?.replaceTrack(null);
+  state.screenStream.getTracks().forEach(t => t.stop());
+  state.screenStream = null;
 
-  if (state.screenStream) {
-    state.screenStream.getTracks().forEach(t => t.stop());
-    state.screenStream = null;
-  }
-
-  state.sharing = false;
-  screenVideo.srcObject = null;
-  screenShareEl.hidden = true;
-
-  updateShareUI();
+  renderScreen();
   channelTrack();
 }
 
-function onScreenTrackEnded() {
-  screenVideo.srcObject = null;
-  screenShareEl.hidden = true;
-}
+function renderScreen() {
+  const remoteSharer = [...state.peers.values()].find(p => p.sharing);
+  const stream = state.screenStream ?? remoteSharer?.screen ?? null;
 
-function updateShareUI() {
-  const remoteSharing = [...state.peers.values()].some(p => p.sharing);
+  if (screenVideo.srcObject !== stream) screenVideo.srcObject = stream;
+  screenShareEl.hidden = !stream;
 
-  shareBtn.innerHTML = state.sharing ? ICON.monitorOff : ICON.monitor;
-  shareBtn.classList.toggle('sharing', state.sharing);
-  shareBtn.disabled = remoteSharing && !state.sharing;
+  shareBtn.innerHTML = state.screenStream ? ICON.monitorOff : ICON.monitor;
+  shareBtn.classList.toggle('sharing', !!state.screenStream);
+  shareBtn.disabled = !!remoteSharer && !state.screenStream;
 }
 
 function toggleMute() {
@@ -754,7 +730,6 @@ function createPeerElement(name, muted, isSelf, peerId) {
     controls.appendChild(muteBtn);
   } else {
     const peer = state.peers.get(peerId);
-    const volume = peer?.volume ?? 1.0;
 
     const slider = document.createElement('input');
     slider.type = 'range';
@@ -762,25 +737,16 @@ function createPeerElement(name, muted, isSelf, peerId) {
     slider.min = 0;
     slider.max = 200;
     slider.step = 25;
-    slider.value = Math.round(volume * 100);
+    slider.value = Math.round(peer.volume * 100);
     slider.addEventListener('input', () => {
-      setPeerVolume(peerId, slider.value / 100);
+      peer.volume = slider.value / 100;
+      if (peer.gainNode) peer.gainNode.gain.value = peer.volume;
     });
     controls.appendChild(slider);
   }
 
   li.appendChild(controls);
   return li;
-}
-
-function setPeerVolume(peerId, value) {
-  const peer = state.peers.get(peerId);
-  if (!peer) return;
-
-  peer.volume = Math.min(2.0, Math.max(0, value));
-  if (peer.gainNode) {
-    peer.gainNode.gain.value = peer.volume;
-  }
 }
 
 function sendChatMessage() {
@@ -867,6 +833,7 @@ function connectToRoom(roomName) {
       try {
         await channel.track(presencePayload());
         state.presenceReady = true;
+        updatePeersFromPresence(channel.presenceState());
       } catch (err) {
         console.error('Failed to track presence:', err);
       }
@@ -880,291 +847,152 @@ function connectToRoom(roomName) {
   });
 }
 
-function isConnectionAlive(pc) {
-  return pc && pc.connectionState !== 'closed' && pc.connectionState !== 'failed';
-}
-
 function updatePeersFromPresence(presenceState) {
-  const activePeerIds = new Set();
+  const presentPeerIds = new Set();
 
-  for (const presences of Object.values(presenceState)) {
-    for (const presence of presences) {
-      if (presence.peerId === state.peerId) continue;
-      activePeerIds.add(presence.peerId);
+  for (const presence of Object.values(presenceState).flat()) {
+    if (presence.peerId === state.peerId) continue;
+    presentPeerIds.add(presence.peerId);
 
-      const existing = state.peers.get(presence.peerId);
-      if (existing) {
-        if (!existing.announced) {
-          appendChat(null, `${presence.name} joined`);
-          playChime([[660, 0], [880, 0.08]]);
-          existing.announced = true;
-        }
-        existing.name = presence.name;
-        existing.muted = presence.muted;
-        existing.sharing = presence.sharing;
-        if (!isConnectionAlive(existing.connection) && state.presenceReady) {
-          createPeerConnection(presence.peerId, presence.name, state.peerId < presence.peerId);
-        }
-      } else if (state.presenceReady) {
-        appendChat(null, `${presence.name} joined`);
-        playChime([[660, 0], [880, 0.08]]);
-        createPeerConnection(presence.peerId, presence.name, state.peerId < presence.peerId);
-        const created = state.peers.get(presence.peerId);
-        if (created) created.announced = true;
-      }
+    let peer = state.peers.get(presence.peerId);
+    if (!peer) {
+      peer = { volume: 1 };
+      state.peers.set(presence.peerId, peer);
     }
+    if (!peer.name) {
+      appendChat(null, `${presence.name} joined`);
+      playChime([[660, 0], [880, 0.08]]);
+    }
+    peer.name = presence.name;
+    peer.muted = presence.muted;
+    peer.sharing = presence.sharing;
+
+    if (state.presenceReady && !peer.pc && state.peerId < presence.peerId) call(presence.peerId, peer);
   }
 
-  for (const [id] of state.peers) {
-    if (!activePeerIds.has(id)) {
-      const peer = state.peers.get(id);
-      if (peer?.announced) {
-        appendChat(null, `${peer.name} left`);
-        playChime([[880, 0], [660, 0.08]]);
-      }
-      removePeer(id);
+  for (const [id, peer] of state.peers) {
+    if (presentPeerIds.has(id)) continue;
+    if (peer.name) {
+      appendChat(null, `${peer.name} left`);
+      playChime([[880, 0], [660, 0.08]]);
     }
-  }
-
-  const anyoneSharing = state.sharing || [...state.peers.values()].some(p => p.sharing);
-  if (!anyoneSharing) {
-    screenVideo.srcObject = null;
-    screenShareEl.hidden = true;
+    closeConnection(id, peer);
+    state.peers.delete(id);
   }
 
   renderPeers();
-  updateShareUI();
+  renderScreen();
 }
 
-async function createPeerConnection(peerId, name, initiator) {
-  const existing = state.peers.get(peerId);
-
-  if (existing && isConnectionAlive(existing.connection)) return;
-
-  const preservedAnnounced = existing?.announced ?? false;
-  const preservedMuted = existing?.muted ?? false;
-
-  if (existing?.connection) {
-    existing.connection.close();
-  }
-  if (existing?.audio) {
-    existing.audio.pause();
-    existing.audio.srcObject = null;
-  }
-
-  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-
-  state.peers.set(peerId, {
-    name,
-    muted: preservedMuted,
-    announced: preservedAnnounced,
-    connection: pc,
-    audio: existing?.audio ?? null,
-    gainNode: existing?.gainNode ?? null,
-    volume: existing?.volume ?? 1.0,
-    iceCandidateBuffer: [],
+async function gatheredLocalDescription(pc) {
+  await pc.setLocalDescription();
+  await new Promise((resolve) => {
+    setTimeout(resolve, ICE_GATHERING_TIMEOUT_MS);
+    pc.addEventListener('icegatheringstatechange', () => {
+      if (pc.iceGatheringState === 'complete') resolve();
+    });
   });
+  return pc.localDescription;
+}
 
-  if (state.localStream) {
-    for (const track of state.localStream.getTracks()) {
-      pc.addTrack(track, state.localStream);
-    }
-  }
+function openConnection(peerId, peer) {
+  closeConnection(peerId, peer);
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  peer.pc = pc;
 
-  if (state.screenStream) {
-    const videoTrack = state.screenStream.getVideoTracks()[0];
-    if (videoTrack) {
-      const sender = pc.addTrack(videoTrack, state.screenStream);
-      capSenderBitrate(sender);
-      state.screenSenders.set(peerId, sender);
-    }
-  }
+  pc.ontrack = ({ track }) => {
+    const stream = new MediaStream([track]);
 
-  pc.ontrack = (event) => {
-    const peer = state.peers.get(peerId);
-    if (!peer) return;
-
-    if (event.track.kind === 'video') {
-      screenVideo.srcObject = event.streams[0];
-      screenShareEl.hidden = false;
-      if (prevScreenTrack) prevScreenTrack.removeEventListener('ended', onScreenTrackEnded);
-      prevScreenTrack = event.track;
-      event.track.addEventListener('ended', onScreenTrackEnded);
+    if (track.kind === 'video') {
+      peer.screen = stream;
+      renderScreen();
       return;
     }
 
-    if (peer.gainNode) {
-      peer.gainNode.disconnect();
-      peer.gainNode = null;
-    }
-    if (peer.audio) {
-      peer.audio.pause();
-      peer.audio.srcObject = null;
-    }
+    peer.audio = new Audio();
+    peer.audio.srcObject = stream;
+    peer.audio.muted = true;
+    peer.audio.play().catch(() => {});
 
-    if (!audioCtx) audioCtx = new AudioContext();
-    const source = audioCtx.createMediaStreamSource(event.streams[0]);
-    const gainNode = audioCtx.createGain();
-    gainNode.gain.value = peer.volume;
-    source.connect(gainNode);
-    gainNode.connect(audioCtx.destination);
-    peer.gainNode = gainNode;
+    peer.gainNode = audioCtx.createGain();
+    peer.gainNode.gain.value = peer.volume;
+    audioCtx.createMediaStreamSource(stream).connect(peer.gainNode).connect(audioCtx.destination);
 
-    const audio = new Audio();
-    audio.srcObject = event.streams[0];
-    audio.muted = true;
-    audio.play().catch(() => {});
-    peer.audio = audio;
-
-    removeVadTracker(peerId);
-    createVadTracker(peerId, event.streams[0]);
-  };
-
-  const channel = state.channel;
-
-  pc.onicecandidate = (event) => {
-    if (event.candidate && state.channel === channel) {
-      channelSend('signal', {
-        from: state.peerId,
-        to: peerId,
-        type: 'ice-candidate',
-        candidate: event.candidate,
-      });
-    }
-  };
-
-  pc.onnegotiationneeded = async () => {
-    if (state.channel !== channel) return;
-    try {
-      makingOffer = true;
-      await pc.setLocalDescription(await pc.createOffer());
-      if (state.channel === channel) {
-        channelSend('signal', {
-          from: state.peerId,
-          to: peerId,
-          type: 'offer',
-          sdp: pc.localDescription,
-        });
-      }
-    } catch (err) {
-      console.warn('Renegotiation failed:', err);
-    } finally {
-      makingOffer = false;
-    }
+    createVadTracker(peerId, stream);
   };
 
   pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'failed') {
-      const peer = state.peers.get(peerId);
-      if (peer && peer.connection === pc) {
-        pc.close();
-      }
+    if (state.peerId < peerId && ['disconnected', 'failed'].includes(pc.connectionState)) {
+      retryIfNotConnected(peerId, peer, pc);
     }
   };
 
-  if (initiator) {
-    try {
-      makingOffer = true;
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      if (state.channel === channel) {
-        channelSend('signal', {
-          from: state.peerId,
-          to: peerId,
-          type: 'offer',
-          sdp: pc.localDescription,
-        });
-      }
-    } catch (err) {
-      console.error(`Failed to create offer for ${name}:`, err);
-      removePeer(peerId);
-      return;
-    } finally {
-      makingOffer = false;
-    }
-  }
+  return pc;
 }
 
-async function handleSignal(payload) {
-  const { from, type } = payload;
+function closeConnection(peerId, peer) {
+  peer.pc?.close();
+  peer.gainNode?.disconnect();
+  peer.audio?.pause();
+  removeVadTracker(peerId);
+  peer.pc = null;
+  peer.gainNode = null;
+  peer.audio = null;
+  peer.screen = null;
+}
 
+function retryIfNotConnected(peerId, peer, pc) {
+  setTimeout(() => {
+    if (peer.pc === pc && pc.connectionState !== 'connected') call(peerId, peer);
+  }, CONNECT_TIMEOUT_MS);
+}
+
+async function call(peerId, peer) {
+  const pc = openConnection(peerId, peer);
+  retryIfNotConnected(peerId, peer, pc);
+  pc.addTransceiver(state.localStream.getAudioTracks()[0], { direction: 'sendrecv' });
+  pc.addTransceiver(state.screenStream?.getVideoTracks()[0] ?? 'video', {
+    direction: 'sendrecv',
+    sendEncodings: [{ maxBitrate: SCREEN_MAX_BITRATE }],
+  });
+
+  const sdp = await gatheredLocalDescription(pc);
+  if (peer.pc === pc) channelSend('signal', { type: 'offer', sdp, from: state.peerId, to: peerId });
+}
+
+async function handleSignal({ from, type, sdp }) {
   try {
     if (type === 'offer') {
       let peer = state.peers.get(from);
-      const pc = peer?.connection;
-
-      const polite = state.peerId > from;
-      const collision = pc && (makingOffer || pc.signalingState !== 'stable');
-
-      if (collision && !polite) return;
-
-      if (!peer || !isConnectionAlive(pc)) {
-        await createPeerConnection(from, 'Connecting...', false);
-        peer = state.peers.get(from);
+      if (!peer) {
+        peer = { volume: 1 };
+        state.peers.set(from, peer);
       }
-      if (!peer?.connection) return;
 
-      const theirPc = peer.connection;
-      if (theirPc.signalingState !== 'stable') {
-        await theirPc.setLocalDescription({ type: 'rollback' });
-      }
-      await theirPc.setRemoteDescription(payload.sdp);
+      const pc = openConnection(from, peer);
+      await pc.setRemoteDescription(sdp);
 
-      for (const candidate of peer.iceCandidateBuffer) {
-        await peer.connection.addIceCandidate(candidate);
-      }
-      peer.iceCandidateBuffer = [];
+      const [audio, video] = pc.getTransceivers();
+      audio.direction = 'sendrecv';
+      video.direction = 'sendrecv';
+      await audio.sender.replaceTrack(state.localStream.getAudioTracks()[0]);
+      await video.sender.replaceTrack(state.screenStream?.getVideoTracks()[0] ?? null);
 
-      const answer = await peer.connection.createAnswer();
-      await peer.connection.setLocalDescription(answer);
+      const answer = await gatheredLocalDescription(pc);
+      if (peer.pc !== pc) return;
+      channelSend('signal', { type: 'answer', sdp: answer, from: state.peerId, to: from });
 
-      channelSend('signal', {
-        from: state.peerId,
-        to: from,
-        type: 'answer',
-        sdp: peer.connection.localDescription,
-      });
+      const params = video.sender.getParameters();
+      params.encodings[0].maxBitrate = SCREEN_MAX_BITRATE;
+      await video.sender.setParameters(params);
     }
 
     if (type === 'answer') {
-      const peer = state.peers.get(from);
-      if (!peer?.connection) return;
-
-      await peer.connection.setRemoteDescription(payload.sdp);
-
-      for (const candidate of peer.iceCandidateBuffer) {
-        await peer.connection.addIceCandidate(candidate);
-      }
-      peer.iceCandidateBuffer = [];
-    }
-
-    if (type === 'ice-candidate') {
-      const peer = state.peers.get(from);
-      if (!peer) return;
-
-      if (peer.connection?.remoteDescription) {
-        await peer.connection.addIceCandidate(payload.candidate);
-      } else if (peer.iceCandidateBuffer) {
-        peer.iceCandidateBuffer.push(payload.candidate);
-      }
+      const pc = state.peers.get(from)?.pc;
+      if (pc?.signalingState === 'have-local-offer') await pc.setRemoteDescription(sdp);
     }
   } catch (err) {
     console.error(`Signaling error (${type} from ${from}):`, err);
-  }
-}
-
-function removePeer(peerId) {
-  const peer = state.peers.get(peerId);
-  if (peer) {
-    if (peer.gainNode) peer.gainNode.disconnect();
-    if (peer.audio) {
-      peer.audio.pause();
-      peer.audio.srcObject = null;
-    }
-    if (peer.connection) peer.connection.close();
-    removeVadTracker(peerId);
-    state.peers.delete(peerId);
   }
 }
 
@@ -1205,7 +1033,7 @@ backBtn.addEventListener('click', () => {
 });
 
 shareBtn.addEventListener('click', () => {
-  if (state.sharing) stopSharing();
+  if (state.screenStream) stopSharing();
   else startSharing();
 });
 
